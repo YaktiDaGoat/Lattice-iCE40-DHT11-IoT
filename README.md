@@ -1,0 +1,1 @@
+Hello this is my skripsi project to interface 6 DHT11 sensors and pushing it to a MQTT broker via UART and ESP32 as the internet bridge
