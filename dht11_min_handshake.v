@@ -3,29 +3,29 @@
 module dht11_min_handshake(
     input  wire clk,       // 12 MHz clock
     input  wire reset_n,   // Active–low reset
-    inout  wire dht_data,  // The DHT11 data line
+    inout  wire dht_data,  // DHT11 data line
     output wire debug_in,
-    output wire [3:0] debug_state,  // 4–bit debug bus (more states)
+    output wire [3:0] debug_state,  // 4–bit debug bus
     output wire uart_tx
 );
 
     // -----------------------------------------------------------
-    // DHT Timing Parameters (derived from a 12 MHz clock)
+    // Timing Parameters (derived from a 12 MHz clock)
     // -----------------------------------------------------------
     localparam integer CLK_FREQ                 = 12_000_000;
     localparam integer T_START_MS               = 18;
-    localparam integer T_START_CYCLES           = (CLK_FREQ / 1000) * T_START_MS; // ~216000 cycles
+    localparam integer T_START_CYCLES           = (CLK_FREQ / 1000) * T_START_MS; // ~216,000 cycles
     localparam integer T_RELEASE_US             = 8;
     localparam integer T_RELEASE_CYCLES         = (CLK_FREQ / 1_000_000) * T_RELEASE_US; // ~360 cycles
     localparam integer T_BIT_THRESHOLD_US       = 50;
     localparam integer T_BIT_THRESHOLD_CYCLES   = (CLK_FREQ / 1_000_000) * T_BIT_THRESHOLD_US; // ~600 cycles
-    localparam integer NUM_BITS                 = 16; // capturing first 16 bits (2 bytes)
+    localparam integer NUM_BITS                 = 32; // Full 32 bits from the DHT11.
     localparam integer T_LOW_BIT_US             = 54;
     localparam integer T_LOW_BIT_CYCLES         = (CLK_FREQ / 1_000_000) * T_LOW_BIT_US;
     localparam integer T_LOW_BIT_MARGIN         = 8;
 
     // -----------------------------------------------------------
-    // DHT I/O -- SB_IO primitive instantiation for open–drain behavior
+    // DHT I/O (using SB_IO for open–drain operation)
     // -----------------------------------------------------------
     wire d_in;
     reg  d_out;
@@ -43,7 +43,7 @@ module dht11_min_handshake(
     assign debug_in = d_in;
 
     // -----------------------------------------------------------
-    // FSM States: expanded to 4 bits to accommodate additional states.
+    // FSM States (expanded to 4 bits for additional states)
     // -----------------------------------------------------------
     localparam S_IDLE           = 4'd0,
                S_START          = 4'd1,
@@ -59,34 +59,39 @@ module dht11_min_handshake(
     reg [3:0] state;
     assign debug_state = state;
 
-    // Counters and bit index.
+    // Counters and Bit Index (6 bits needed for 32 bits)
     reg [17:0] counter;
-    reg [4:0]  bit_index;
+    reg [5:0]  bit_index;
 
     // -----------------------------------------------------------
-    // Block RAM signals for accumulating sensor data.
+    // BRAM Signals for 32–bit accumulator (split into two 16–bit parts)
     // -----------------------------------------------------------
-    // We use a 16-bit wide dedicated memory to hold the accumulator.
-    // The current content of the BRAM is continuously read as "bram_dout"
-    // and used in the shift–update operation.
-    wire [15:0] bram_dout;
-    reg  [15:0] bram_din;
-    reg         ram_we;
+    wire [15:0] bram_hi_dout, bram_lo_dout;
+    reg  [15:0] bram_hi_din, bram_lo_din;
+    reg         ram_we;  // Write enable for both BRAMs
 
-    // "new_bit" is computed based on the high–pulse width.
+    // New bit computed from the pulse width.
     reg         new_bit;
 
-    // Instantiate the 16-bit BRAM module.
-    bram_16bit bram_inst (
+    // Instantiate two 16–bit block RAMs: one for the high word and one for the low word.
+    bram_16bit bram_hi (
         .clk(clk),
         .we(ram_we),
-        .addr(1'b0),      // Using a fixed address (only one accumulator)
-        .din(bram_din),
-        .dout(bram_dout)
+        .addr(1'b0),
+        .din(bram_hi_din),
+        .dout(bram_hi_dout)
+    );
+
+    bram_16bit bram_lo (
+        .clk(clk),
+        .we(ram_we),
+        .addr(1'b0),
+        .din(bram_lo_din),
+        .dout(bram_lo_dout)
     );
 
     // -----------------------------------------------------------
-    // Main FSM: DHT11 handshake, bit–reading, and direct BRAM update
+    // Main FSM: DHT11 handshake and direct update of the 32–bit accumulator.
     // -----------------------------------------------------------
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -96,13 +101,14 @@ module dht11_min_handshake(
             d_out      <= 1'b1;
             oe         <= 1'b0;
             ram_we     <= 1'b0;
-            bram_din   <= 16'd0;  // Reset accumulator to zero.
+            bram_hi_din<= 16'd0;
+            bram_lo_din<= 16'd0;
             new_bit    <= 1'b0;
         end else begin
             case (state)
                 S_IDLE: begin
                     state   <= S_START;
-                    oe      <= 1'b1;  // Drive line low to initiate DHT11 start.
+                    oe      <= 1'b1;  // Drive line low to start DHT11 transaction.
                     d_out   <= 1'b0;
                     counter <= 0;
                 end
@@ -142,17 +148,16 @@ module dht11_min_handshake(
                         counter <= counter + 1;
                     end else begin
                         if (counter >= T_LOW_BIT_CYCLES) begin
-                            state <= S_READ_BIT_START;
+                            state     <= S_READ_BIT_START;
                             bit_index <= 0;
                             counter   <= 0;
-                        end else begin
+                        end else
                             counter <= 0;
-                        end
                     end
                 end
 
                 S_READ_BIT_START: begin
-                    // Wait until the sensor drives the line high to start measuring the bit pulse.
+                    // Wait until the sensor drives the line high for bit measurement.
                     if (d_in == 1'b1) begin
                         counter <= 0;
                         state   <= S_READ_BIT_HIGH;
@@ -160,10 +165,10 @@ module dht11_min_handshake(
                 end
 
                 S_READ_BIT_HIGH: begin
-                    if (d_in == 1'b1) begin
+                    if (d_in == 1'b1)
                         counter <= counter + 1;
-                    end else begin
-                        // Determine the bit value based on pulse duration.
+                    else begin
+                        // Compare the pulse width to decide if bit is 0 or 1.
                         if (counter < T_BIT_THRESHOLD_CYCLES)
                             new_bit <= 1'b0;
                         else
@@ -176,16 +181,16 @@ module dht11_min_handshake(
                 end
 
                 S_UPDATE: begin
-                    // Directly update the BRAM accumulator:
-                    // new value = (previous value << 1) | new_bit.
-                    // Note that bram_dout holds the current stored value (available one cycle later).
-                    bram_din <= { bram_dout[14:0], new_bit };
-                    ram_we   <= 1'b1;  // Assert write–enable.
-                    state    <= S_WAIT_WRITE;
+                    // Update the 32–bit accumulator (split across two BRAMs)
+                    // New accumulator = { bram_hi_dout[14:0], bram_lo_dout[15],
+                    //                     bram_lo_dout[14:0], new_bit }
+                    bram_hi_din <= { bram_hi_dout[14:0], bram_lo_dout[15] };
+                    bram_lo_din <= { bram_lo_dout[14:0], new_bit };
+                    ram_we      <= 1'b1;  // Write the updated value.
+                    state       <= S_WAIT_WRITE;
                 end
 
                 S_WAIT_WRITE: begin
-                    // One clock cycle for the write to take effect.
                     ram_we <= 1'b0;
                     if (bit_index == NUM_BITS)
                         state <= S_DONE;
@@ -194,7 +199,7 @@ module dht11_min_handshake(
                 end
 
                 S_DONE: begin
-                    // Acquisition complete. The accumulated 16–bit data is now stored in bram_dout.
+                    // Final accumulator (32 bits) is now available via {bram_hi_dout, bram_lo_dout}.
                     state <= S_DONE;
                 end
 
@@ -204,7 +209,7 @@ module dht11_min_handshake(
     end
 
     // -----------------------------------------------------------
-    // UART Transmit FSM: Send the 2 bytes (upper and lower) over UART
+    // UART Transmit FSM: Send 4 bytes (32 bits) over UART.
     // -----------------------------------------------------------
     localparam UART_IDLE     = 3'd0,
                UART_LOAD     = 3'd1,
@@ -213,24 +218,24 @@ module dht11_min_handshake(
                UART_FINISHED = 3'd4;
 
     reg [2:0] uart_state;
-    reg       uart_send;
+    reg [1:0] byte_index;  // 0 to 3: four bytes.
     reg [7:0] uart_data;
-    reg       byte_index;  // 0: upper byte; 1: lower byte.
+    reg       uart_send;
     wire      uart_busy;
 
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
             uart_state <= UART_IDLE;
-            byte_index <= 1'b0;
+            byte_index <= 2'd0;
             uart_send  <= 1'b0;
             uart_data  <= 8'd0;
         end else begin
             case (uart_state)
                 UART_IDLE: begin
                     if (state == S_DONE) begin
-                        // Load first byte (upper 8 bits from the BRAM accumulator).
-                        uart_data  <= bram_dout[15:8];
-                        byte_index <= 1'b0;
+                        // Load first byte: upper 8 bits of the high word.
+                        uart_data  <= bram_hi_dout[15:8];
+                        byte_index <= 2'd0;
                         uart_state <= UART_LOAD;
                     end
                 end
@@ -239,7 +244,7 @@ module dht11_min_handshake(
                 end
                 UART_SEND: begin
                     if (!uart_busy && !uart_send) begin
-                        uart_send <= 1'b1;  // Trigger transmission.
+                        uart_send <= 1'b1;
                     end else begin
                         uart_send <= 1'b0;
                         if (uart_busy)
@@ -248,12 +253,15 @@ module dht11_min_handshake(
                 end
                 UART_WAIT: begin
                     if (!uart_busy && !uart_send) begin
-                        if (byte_index == 1'b1)
+                        if (byte_index == 2'd3)
                             uart_state <= UART_FINISHED;
                         else begin
-                            byte_index <= 1'b1;
-                            // Load second byte (lower 8 bits)
-                            uart_data  <= bram_dout[7:0];
+                            byte_index <= byte_index + 1;
+                            case (byte_index + 1)
+                                2'd1: uart_data <= bram_hi_dout[7:0];   // second byte (low part of high word)
+                                2'd2: uart_data <= bram_lo_dout[15:8];  // third byte (upper part of low word)
+                                2'd3: uart_data <= bram_lo_dout[7:0];   // fourth byte (low part of low word)
+                            endcase
                             uart_state <= UART_LOAD;
                         end
                     end
@@ -267,8 +275,8 @@ module dht11_min_handshake(
     end
 
     // -----------------------------------------------------------
-    // UART Transmitter Module Instantiation.
-    // (Assumes you have a uart_tx module defined elsewhere.)
+    // UART Transmitter Instantiation
+    // Assumes the presence of a compatible uart_tx module.
     // -----------------------------------------------------------
     uart_tx #(
         .CLK_FREQ(CLK_FREQ),
