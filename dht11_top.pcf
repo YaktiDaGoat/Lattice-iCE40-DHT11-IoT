@@ -1,0 +1,9 @@
+set_io clk                      21
+set_io -pullup yes reset_n      78
+set_io -pullup yes dht_data1    87
+set_io -pullup yes dht_data2    88
+set_io debug_state[0]           80
+set_io debug_state[1]           81
+set_io debug_state[2]           90
+set_io uart_tx                  79
+
