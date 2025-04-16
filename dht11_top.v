@@ -16,8 +16,6 @@ module dht11_top(
         .clk(clk),
         .reset_n(reset_n),
         .dht_data(dht_data1),
-        //.debug_in(),          // not routed
-        //.debug_state(),       // not routed
         .data_valid(data_valid1),
         .sensor_data(sensor_data1)
     );
@@ -31,8 +29,6 @@ module dht11_top(
         .clk(clk),
         .reset_n(reset_n),
         .dht_data(dht_data2),
-        //.debug_in(),
-        //.debug_state(),
         .data_valid(data_valid2),
         .sensor_data(sensor_data2)
     );
@@ -46,7 +42,7 @@ module dht11_top(
     
     uart_tx #(
          .CLK_FREQ(12000000),
-         .BAUD_RATE(115200)
+         .BAUD_RATE(9600)
     ) uart_transmitter (
          .clk(clk),
          .reset_n(reset_n),
@@ -57,42 +53,46 @@ module dht11_top(
     );
     
     // -----------------------------------------------------
-    // Main FSM states for sequencing sensor data transmissions
-    // (Now using 3 bits)
+    // Main FSM states for sequencing sensor data transmissions.
+    // Now using 3-bit states.
     // -----------------------------------------------------
-    localparam TX_IDLE    = 3'd0,  // Wait for both sensors to have valid data and latch them.
-               TX_SENSOR1 = 3'd1,  // Transmit sensor1’s 4 bytes.
-               TX_DELAY   = 3'd2,  // 2-clock cycle delay.
-               TX_SENSOR2 = 3'd3,  // Transmit sensor2’s 4 bytes.
-               TX_DONE    = 3'd4;  // Final state; do nothing (freeze).
-               
+    localparam TX_IDLE    = 3'd0,  // Wait for both sensors to have valid data.
+               TX_PRE     = 3'd1,  // Wait 10 clock cycles before starting UART output.
+               TX_SENSOR1 = 3'd2,  // Transmit sensor1's 4 bytes.
+               TX_DELAY   = 3'd3,  // Wait exactly 10 clock cycles.
+               TX_SENSOR2 = 3'd4,  // Transmit sensor2's 4 bytes.
+               TX_DONE    = 3'd5;  // Final state; the FSM stops here.
+
     reg [2:0] tx_state;
-    assign debug_state = tx_state;  // Debug port (0: idle, 1: sensor1, 2: delay, 3: sensor2, 4: done)
+    assign debug_state = tx_state;  // Debug output shows the current state.
     
     // -----------------------------------------------------
-    // Sub-FSM for transmitting one byte using uart_tx.
-    // We'll use these three states to generate a one-clock send pulse
-    // and wait for UART busy to rise then fall.
+    // Sub-FSM for transmitting one byte via uart_tx.
+    // This sub-FSM produces a one-clock send pulse and waits for uart_busy
+    // to go active then inactive, indicating the byte has been transmitted.
     // -----------------------------------------------------
     localparam SUB_IDLE      = 2'd0,
                SUB_TRIGGER   = 2'd1,
                SUB_WAIT_DONE = 2'd2;
+               
+    reg [1:0] sub_state;  // Sub-FSM state for byte transmission.
+    reg [1:0] byte_index; // Index for the 4 bytes (0 to 3).
     
-    reg [1:0] sub_state;  // Sub-FSM state for byte transmission
-    reg [1:0] byte_index; // To index the 4 bytes (0 to 3)
-    
-    // We'll latch sensor data in TX_IDLE.
+    // Latch sensor data once both signals are valid.
     reg [31:0] sensor1_data_reg, sensor2_data_reg;
     reg sensor_data_latched;
     
-    // A simple delay counter for TX_DELAY state.
-    reg [1:0] delay_cnt;
+    // A delay counter for the TX_DELAY state.
+    reg [3:0] delay_cnt;  // Now wide enough for 10-cycle delay.
     
-    // To detect the completion of a byte, capture uart_busy from the previous clock.
+    // A pre-delay counter for TX_PRE state (10 cycles).
+    reg [3:0] pre_delay_cnt;
+    
+    // For edge detection: capture the previous value of uart_busy.
     reg prev_uart_busy;
     
     // -----------------------------------------------------
-    // Main FSM with integrated sub-FSM for byte transmissions.
+    // Main FSM with integrated sub-FSM for byte transmission.
     // -----------------------------------------------------
     always @(posedge clk or negedge reset_n) begin
         if (!reset_n) begin
@@ -103,29 +103,41 @@ module dht11_top(
             sensor_data_latched <= 1'b0;
             sensor1_data_reg    <= 32'd0;
             sensor2_data_reg    <= 32'd0;
+            pre_delay_cnt       <= 0;
             delay_cnt           <= 0;
             data_byte           <= 8'd0;
             prev_uart_busy      <= 1'b0;
         end else begin
-            // Capture previous uart_busy value for edge detection.
+            // Capture previous uart_busy for edge detection.
             prev_uart_busy <= uart_busy;
             
             case (tx_state)
             
                 TX_IDLE: begin
-                    // Wait for both sensors to have valid data.
+                    // Wait until both sensor interfaces signal valid data.
                     if (data_valid1 && data_valid2 && !sensor_data_latched) begin
                         sensor1_data_reg    <= sensor_data1;
                         sensor2_data_reg    <= sensor_data2;
                         sensor_data_latched <= 1'b1;
                         byte_index          <= 0;
                         sub_state           <= SUB_IDLE;
-                        tx_state            <= TX_SENSOR1;  // start with sensor1 transmission.
+                        pre_delay_cnt       <= 0;
+                        tx_state            <= TX_PRE;  // Proceed to pre-delay state.
+                    end
+                end
+                
+                TX_PRE: begin
+                    // Wait a total of 10 clock cycles before starting UART output.
+                    if (pre_delay_cnt < 10 - 1) begin
+                        pre_delay_cnt <= pre_delay_cnt + 1;
+                    end else begin
+                        pre_delay_cnt <= 0;
+                        tx_state      <= TX_SENSOR1;
                     end
                 end
                 
                 TX_SENSOR1: begin
-                    // Sub-FSM to transmit one byte from sensor1_data_reg.
+                    // Use the sub-FSM to transmit one byte from sensor1_data_reg.
                     case (sub_state)
                         SUB_IDLE: begin
                             if (!uart_busy) begin
@@ -136,28 +148,26 @@ module dht11_top(
                                     2'd3: data_byte <= sensor1_data_reg[7:0];
                                     default: data_byte <= 8'd0;
                                 endcase
-                                send       <= 1'b1;          // Trigger UART transmission.
+                                send       <= 1'b1; // Issue the send pulse.
                                 sub_state  <= SUB_TRIGGER;
                             end
                         end
                         
                         SUB_TRIGGER: begin
-                            // End the send pulse.
-                            send <= 1'b0;
-                            sub_state <= SUB_WAIT_DONE;
+                            send       <= 1'b0;
+                            sub_state  <= SUB_WAIT_DONE;
                         end
                         
                         SUB_WAIT_DONE: begin
-                            // Wait for UART busy to go high then fall (byte complete)
+                            // Wait for the UART to assert busy (rising edge) then deassert (falling edge).
                             if (prev_uart_busy && !uart_busy) begin
                                 if (byte_index == 3) begin
-                                    // Finished sensor1; move to delay state.
+                                    // Finished transmitting sensor1's bytes; move to TX_DELAY.
                                     byte_index <= 0;
                                     delay_cnt  <= 0;
                                     sub_state  <= SUB_IDLE;
                                     tx_state   <= TX_DELAY;
                                 end else begin
-                                    // Move on to the next byte.
                                     byte_index <= byte_index + 1;
                                     sub_state  <= SUB_IDLE;
                                 end
@@ -167,9 +177,11 @@ module dht11_top(
                 end
                 
                 TX_DELAY: begin
-                    if (delay_cnt < 2 - 1) begin
+                    // Wait exactly 10 clock cycles between sensor transmissions.
+                    if (delay_cnt < 10 - 1) begin
                         delay_cnt <= delay_cnt + 1;
                     end else begin
+                        delay_cnt <= 0;
                         byte_index <= 0;
                         sub_state  <= SUB_IDLE;
                         tx_state   <= TX_SENSOR2;
@@ -177,7 +189,7 @@ module dht11_top(
                 end
                 
                 TX_SENSOR2: begin
-                    // Sub-FSM to transmit one byte from sensor2_data_reg.
+                    // Use the sub-FSM to transmit one byte from sensor2_data_reg.
                     case (sub_state)
                         SUB_IDLE: begin
                             if (!uart_busy) begin
@@ -201,11 +213,11 @@ module dht11_top(
                         SUB_WAIT_DONE: begin
                             if (prev_uart_busy && !uart_busy) begin
                                 if (byte_index == 3) begin
-                                    // Finished sensor2 transmission.
-                                    sensor_data_latched <= 1'b0;  // Not latching new data.
+                                    // Finished sensor2 transmission; move to TX_DONE.
+                                    sensor_data_latched <= 1'b0;  // Optionally, allow new data to be latched.
                                     byte_index <= 0;
                                     sub_state  <= SUB_IDLE;
-                                    tx_state   <= TX_DONE;         // Transition to final state.
+                                    tx_state   <= TX_DONE;
                                 end else begin
                                     byte_index <= byte_index + 1;
                                     sub_state  <= SUB_IDLE;
@@ -216,7 +228,7 @@ module dht11_top(
                 end
                 
                 TX_DONE: begin
-                    // Stay here (freeze). You could also drive a done flag if desired.
+                    // Remain in TX_DONE (final state).
                     tx_state <= TX_DONE;
                 end
                 
