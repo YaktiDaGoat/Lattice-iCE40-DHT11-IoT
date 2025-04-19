@@ -38,7 +38,7 @@ module uart_tx #(parameter CLK_FREQ = 12000000, parameter BAUD_RATE = 9600)
                     baud_counter <= 0;
                     if (bit_index < 8) begin
                         tx        <= shift_reg[0];
-                        shift_reg <= {1'b0, shift_reg[7:1]};
+                        shift_reg <= {1'b0, shift_reg[7:1]}; //shift the 8 bit reg to the right (sending the data to tx to the right)
                         bit_index <= bit_index + 1;
                     end else if (bit_index == 8) begin
                         tx        <= 1'b1;  // Stop bit

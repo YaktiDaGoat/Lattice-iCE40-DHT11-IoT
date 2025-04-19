@@ -162,7 +162,7 @@ module dht11_interface(
                     if (d_in == 1'b1)
                         counter <= counter + 1;
                     else begin
-                        // Use pulse width to decide 0 or 1.
+                        // Use pulse width to decide 0 or 1. Shift register. data writes from the very right and shifted left when new data is sampled.
                         if (counter < T_BIT_THRESHOLD_CYCLES)
                             raw_data <= { raw_data[30:0], 1'b0 };
                         else
